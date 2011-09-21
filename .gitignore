@@ -1,0 +1,12 @@
+## maven
+target/
+
+##eclipse
+.classpath
+.project
+.settings/
+eclipse-build/
+*/.project
+*/.classpath
+*/.settings
+*/eclipse-build
