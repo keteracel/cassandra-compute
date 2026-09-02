@@ -48,6 +48,14 @@ Internode dispatch (step 2a→2b) reuses `MessagingService`/`Verb`, which is int
 
 Scope note: a custom `QueryHandler` only sees requests arriving via the native protocol — not batchlog replay, hints, or view updates. This is acceptable here since `EntryProcessor` submission is always a fresh client-initiated call, never a replayed one.
 
+### Per-key mutual exclusion during EntryProcessor execution
+
+**Decided**: no other write to a key may proceed while an `EntryProcessor` invocation for that key is in progress. `EntryProcessorRequestHandler.execute()` and `EntryDispatch.invokeLocally()` hold a per-`(table, key)` lock (`EntryLocks`, a `Striped<Lock>` — `Striped.lazyWeakLock`) for the entire read-modify-write, mirroring Cassandra's own precedent for exactly this problem shape: `CounterMutation`'s striped cell-level locks, which serialize a counter increment's local read-modify-write the same way, for the same reason (a read must happen before the corresponding write, so two concurrent operations on the same partition must not interleave).
+
+**Scope, precisely**: this guarantees mutual exclusion among invocations that go through the compute layer — `EntryProcessor` today, and any future map put/remove built on the same path. It does **not** block a plain CQL write issued directly against the backing table outside the map API; doing so would mean hooking Cassandra's universal write path for every table, not just compute-layer-managed ones — a materially bigger and riskier change than anything else in this project, deliberately not taken. In practice this is not a new gap: the product spec's "distributed map abstraction" was never a guarantee that raw CQL access races safely with it.
+
+**A correctness subtlety this surfaced** (found via the multi-node integration test, not anticipated in the original design): `StorageProxy.mutate(...)`'s local-replica application happens inside `performLocally`, submitted *asynchronously* to the `MUTATION` stage. Its ack races the other natural replicas' acks to satisfy whatever `ConsistencyLevel` the caller requested. Under anything short of `ALL` with more than one replica, `mutate()` can therefore return successfully — satisfied by a **remote** replica's ack — before this node's own local apply has actually run. Since the whole point of `EntryLocks` is "the next invocation for this key must see this write once it acquires the lock," relying on `mutate()`'s return as that signal is unsound at CL < ALL. Fix: `EntryProcessorRequestHandler.execute()` and `EntryDispatch.invokeLocally()` now call `mutation.apply()` synchronously themselves, immediately before handing the same mutation to `StorageProxy.mutate(...)` — the latter's own local re-application becomes a harmless idempotent no-op (same delta, same timestamp), and now performs only its original job of replicating to the other natural replicas at the requested CL. This local-apply guarantee is unconditional — it does not weaken or change the caller-visible CL contract for cluster-wide durability, which is exactly what the caller requested and still gets.
+
 ## Data Model
 
 ```java
@@ -111,6 +119,8 @@ if (replicas.get(0).endpoint().isSelf()) {
 **Failure surface**: `StorageProxy.mutate(...)` throws `UnavailableException` / `WriteTimeoutException` / `WriteFailureException` / `OverloadedException` unmodified — these propagate to the caller as-is (matching the product spec's "same contract as any Cassandra write" decision). A processor that throws is caught by the handler and returned as a distinct `EntryProcessorException` in `EntryProcessorResponse`, so callers can tell "my logic failed" apart from "the write didn't meet its consistency level."
 
 ## Implementation Plan
+
+Status: steps 1–6, 8, and 9 are implemented and committed on the `cassandra-compute` branch of the `vendor/cassandra` fork (plus per-key locking, not originally listed here — see "Per-key mutual exclusion" above). Step 7 (client-facing entry point) remains outstanding.
 
 1. **Establish the embedded build** — vendor/patch the Cassandra 5.0.6 source tree as the build basis (this project's build produces a modified Cassandra distribution, not a jar dependency). Decide and document the patch-maintenance approach (source overlay vs. maintained fork branch) so future Cassandra version bumps are tractable. No dependency on other tasks.
 2. **`EntryProcessor` / `EntryProcessorContext` interfaces** and the delta-builder wrapper around `Row.SimpleBuilder`. Pure new code, no Cassandra internals touched yet.
