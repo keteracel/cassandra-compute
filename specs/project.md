@@ -1,0 +1,73 @@
+# cassandra-compute — Product Spec
+
+## Problem & Goal
+
+`cassandra-compute` is a dormant 2011-era project being resurrected with a new, concrete goal: build an **In-Memory Data Grid (IMDG)**, in the spirit of Hazelcast, that uses **Apache Cassandra** as its storage and retrieval engine rather than a bespoke in-memory replication protocol.
+
+The core problem Hazelcast-style IMDGs solve is letting distributed compute run *where the data lives* — instead of pulling a large value across the network to mutate it and writing it back, you ship a small unit of logic (an `EntryProcessor`) to the node that owns the data, execute it locally, and get back only the result. This project's goal is to bring that model to Cassandra: use Cassandra's own partitioning and replication as the source of truth for "who owns this key," and route compute accordingly — to the **primary** replica via `EntryProcessor`, and to **secondary/backup** replicas via `BackupEntryProcessor`, so processor side effects stay consistent with Cassandra's replica set instead of only living in a separate in-memory copy.
+
+Outcome: a Java library/runtime that lets an application store data in Cassandra and execute processor logic co-located with the correct replica(s) for a key, without the application manually tracking cluster topology.
+
+## Users
+
+The primary user is a **JVM application developer** embedding this as a library to get data-local compute over data that's stored in Cassandra — e.g. counters, aggregations, or read-modify-write logic that's expensive or racy to do by pulling data client-side. They care about:
+- Correctness of routing (compute actually runs where the data's replicas are)
+- Not having to hand-roll cluster topology tracking or Cassandra token-ring math
+- A programming model that feels familiar if they've used Hazelcast/Coherence-style entry processors
+
+A secondary user is the **operator** running the compute-node cluster alongside (or embedded in) Cassandra, who cares about failover behavior when a primary node is unreachable, and about the deployment topology being something they can reason about and run.
+
+## Scope
+
+### In scope
+- A distributed map abstraction backed by Cassandra tables (basic put/get/remove semantics for entries).
+- `EntryProcessor` execution: given a key, route execution to the Cassandra node that is the **primary** owner of that key's partition, execute the processor logic there, return the result.
+- `BackupEntryProcessor` execution: route corresponding backup logic to **secondary/replica** owners, so processor side effects are consistent with Cassandra's own replica set.
+- Cluster topology awareness derived from Cassandra's partitioner and replication strategy (token ranges → replica sets), kept up to date as topology changes (nodes joining/leaving, ring changes).
+- An inter-node coordination/RPC layer for dispatching processor execution requests to the correct node(s), embedded inside the Cassandra process and built on Cassandra's own internode `MessagingService`, with a fast local-execution path that bypasses serialization when the receiving node is already the correct owner.
+- Basic failure handling: behavior when a primary owner for a key is unreachable (e.g., failover to a backup owner).
+- A modernized build: current-generation Cassandra Java driver and JDK target, replacing the 2011 `cassandra-all:1.0.0-beta1` / Java 1.6 baseline.
+
+### Out of scope
+- Multi-datacenter / WAN replication-aware routing (single-DC/single-ring assumed for v1).
+- A general CQL/SQL query engine — only key-addressed entry access and processor execution.
+- Security/authn/authz (client auth, inter-node TLS, ACLs on processors) — flagged as a later concern, not designed here.
+- A management UI, admin console, or metrics dashboard.
+- Non-Java client bindings.
+- Multi-key/cross-partition transactions — processors operate on a single key's entry.
+- Reimplementing or repairing the legacy `thrift.*` proxy code — treated as historical, not a dependency for this effort.
+
+## User Stories
+
+1. As a developer, I want to put/get/remove entries in a distributed map so my application can share state across nodes, durably backed by Cassandra rather than a separate in-memory replication mechanism.
+2. As a developer, I want to submit an `EntryProcessor` for a given key and have it execute on the node that is the **primary** owner of that key's partition, so I get atomic, data-local read-modify-write without shipping the value over the network.
+3. As a developer, I want a corresponding `BackupEntryProcessor` to execute on the **secondary/replica** owners of a key, so that processor-driven mutations stay consistent with Cassandra's own replica set instead of diverging from it.
+4. As an operator, I want compute nodes to automatically derive primary/replica ownership for a key from Cassandra's partitioner and replication strategy, so routing stays correct without manual configuration as the cluster scales.
+5. As an operator, when the primary owner for a key is unreachable, I want `EntryProcessor` execution to have defined failover behavior (e.g., route to a backup, or fail clearly) rather than hang or silently do nothing.
+6. As a developer, I want this to run against a currently-supported Cassandra version and JDK, so the project is actually deployable rather than pinned to 2011-era dependencies.
+
+## Acceptance Criteria
+
+- [ ] A client can `put(key, value)`, `get(key)`, and `remove(key)` against a named distributed map, and the data is verifiably persisted in Cassandra (visible via CQL, survives compute-node restart).
+- [ ] Submitting an `EntryProcessor` for a key executes it on the compute node co-located with (or responsible for) the Cassandra node that is the current primary replica for that key's partition — verified by instrumenting which node actually ran the processor and comparing it against Cassandra's reported replica ownership (e.g. `nodetool getendpoints`) for that key.
+- [ ] Submitting a `BackupEntryProcessor` for a key executes it on the node(s) corresponding to the key's secondary/replica owners (not the primary), verified the same way.
+- [ ] When cluster topology changes (a node joins or leaves the ring, changing token ownership), subsequently submitted processors route to the *new* correct owner without requiring a restart or manual config change.
+- [ ] When the primary owner for a key is unreachable at submission time, the system exhibits one specific, documented behavior (either: automatic failover to a backup owner and success, or a clear, typed failure returned to the caller) — "undefined/hangs" is not acceptable.
+- [ ] The project builds and runs against a current-generation Cassandra release and a current LTS JDK, with no dependency on `cassandra-all:1.0.0-beta1` or Java 1.6.
+- [ ] A processor that throws an exception returns that failure to the caller distinctly from a network/routing failure (the two are distinguishable in the API).
+- [ ] Replica nodes never execute processor code for a `BackupEntryProcessor` step — only apply the delta produced by the primary's `EntryProcessor` run (verifiable by confirming no processor invocation occurs on replica nodes, only mutation application).
+- [ ] `EntryProcessor` submission accepts a `ConsistencyLevel` and exhibits the same ack-counting, timeout, and hinted-handoff behavior as an equivalent plain Cassandra write at that level (verifiable by killing a replica and confirming behavior matches a normal CQL write at the same CL).
+
+## Decided
+
+- **Deployment topology**: The compute layer is **embedded inside the Cassandra process itself** (coprocessor-style), not a separate colocated JVM cluster. This means the compute layer shares the Cassandra node's own view of the ring/topology directly rather than maintaining a parallel membership protocol.
+- **Local execution bypasses serialization**: When the node that receives a processor submission is *already* the correct owner (primary for `EntryProcessor`, a replica for `BackupEntryProcessor`), execution happens as a direct in-process call — no serialize/deserialize round trip. Serialization (of key, entry, and processor) is only on the path when the request must actually cross the network to reach a different node. This is a first-class performance requirement, not just an optimization detail, and shapes the API/interface contract (the dispatch layer needs a fast "am I already the owner" check before falling back to remote dispatch).
+- **Stay as close to vanilla Cassandra internals as possible**: this is a governing design principle, not just an RPC choice. Concretely for the remote dispatch path, it means reusing Cassandra's own internode messaging system (`org.apache.cassandra.net.MessagingService`, Netty-based since 4.0) rather than introducing a separate RPC framework (no gRPC, no Thrift, no Protobuf/Avro) — register a custom message `Verb` for `EntryProcessor`/`BackupEntryProcessor` dispatch, and serialize payloads via Cassandra's own `IVersionedSerializer<T>` convention, matching its existing framing/version-handshake/CRC handling. The same principle should guide the remaining open questions below: prefer Cassandra's existing mechanisms (`TokenMetadata`/gossip for topology, its `ConsistencyLevel` enum for consistency interplay, its own replication-strategy classes for replica-set computation) over parallel bespoke implementations, and the technical spec should default to "how does Cassandra itself already do this" before proposing something new.
+- **Processor identity is a class reference, not shipped code/state**: `EntryProcessor`/`BackupEntryProcessor` implementations are deployed ahead of time to every node (like a JAR on the classpath) and referenced by class name/id over the wire, not serialized as closures or bytecode. This keeps remote-dispatch payloads minimal (key + processor reference + any small init args) and avoids a code-shipping/classloading design entirely.
+- **`BackupEntryProcessor` is not user-authored logic — it's the delta produced by `EntryProcessor`, applied via Cassandra's normal write path.** `EntryProcessor.process(entry)` must produce its result as a **delta** (a `Mutation`/`PartitionUpdate`-shaped set of changed cells/columns — e.g. "set these columns," "apply this increment"), not a full replacement value. That delta is handed to Cassandra's existing write machinery (`StorageProxy`-equivalent) exactly as any CQL-driven write would be: replica-set resolution, dispatch over `MessagingService`, ack-counting against the caller's `ConsistencyLevel`, hinted handoff for unreachable replicas — all unmodified. Because there's no independent behavior at the replica beyond applying the mutation, this requires **no new message `Verb`** — dispatch goes through Cassandra's existing `MUTATION_REQ` handling as-is. "Backup on every write" is therefore not a separate mechanism layered on top of Cassandra's replication — it *is* Cassandra's replication, triggered by a processor-computed delta instead of a parsed CQL statement. Replicas never re-execute business logic and never receive more than the changed cells, satisfying both original goals (avoid recomputation at backups; minimize network traffic for partial updates) as a natural consequence of reusing the real write path rather than as something to separately design for.
+- **Consistency-level interplay is fully inherited from Cassandra, not reinvented**: since the delta rides the normal write path, `EntryProcessor` submission takes a standard `ConsistencyLevel` (ONE/QUORUM/LOCAL_QUORUM/ALL/etc.) governing how many replicas must apply the delta before the call returns — identical semantics, timeouts, and exceptions (`WriteTimeoutException`/`UnavailableException`-equivalent) to any other Cassandra write. The read half of `EntryProcessor` (reading current state before computing the delta) reads locally, since execution always happens at the primary owner, which already holds the authoritative local copy — no separate read `ConsistencyLevel` is needed for that step.
+- **Target Cassandra version: 5.0.6.** Embedding is built against this specific release's internals (`MessagingService`, `TokenMetadata`, replication strategy classes, etc.); no cross-version compatibility is in scope for v1.
+
+## Open Questions
+
+None outstanding — all prior open questions were resolved during design discussion (see Decided section above).
