@@ -1,0 +1,3 @@
+[submodule "vendor/cassandra"]
+	path = vendor/cassandra
+	url = git@github.com:keteracel/cassandra.git
