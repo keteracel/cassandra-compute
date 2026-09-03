@@ -28,20 +28,21 @@ public final class ComputeMap
     private final String keyspace;
     private final String table;
 
-    private final PreparedStatement putStatement;
-    private final PreparedStatement getStatement;
-    private final PreparedStatement removeStatement;
+    private final String quotedTable;
+
+    // Prepared lazily rather than in the constructor: ensureSchema() creates the backing table, and callers are
+    // expected to construct a ComputeMap before calling it (see ensureSchema's javadoc), so preparing eagerly
+    // would fail against a table that doesn't exist yet.
+    private volatile PreparedStatement putStatement;
+    private volatile PreparedStatement getStatement;
+    private volatile PreparedStatement removeStatement;
 
     public ComputeMap(CqlSession session, String keyspace, String table)
     {
         this.session = session;
         this.keyspace = keyspace;
         this.table = table;
-
-        String quotedTable = quoteIdentifier(keyspace) + "." + quoteIdentifier(table);
-        this.putStatement = session.prepare("INSERT INTO " + quotedTable + " (key, value) VALUES (?, ?)");
-        this.getStatement = session.prepare("SELECT value FROM " + quotedTable + " WHERE key = ?");
-        this.removeStatement = session.prepare("DELETE FROM " + quotedTable + " WHERE key = ?");
+        this.quotedTable = quoteIdentifier(keyspace) + "." + quoteIdentifier(table);
     }
 
     /**
@@ -51,13 +52,12 @@ public final class ComputeMap
      */
     public void ensureSchema()
     {
-        String quotedTable = quoteIdentifier(keyspace) + "." + quoteIdentifier(table);
         session.execute("CREATE TABLE IF NOT EXISTS " + quotedTable + " (key text PRIMARY KEY, value blob)");
     }
 
     public void put(String key, ByteBuffer value)
     {
-        session.execute(putStatement.bind(key, value));
+        session.execute(putStatement().bind(key, value));
     }
 
     /**
@@ -65,13 +65,31 @@ public final class ComputeMap
      */
     public ByteBuffer get(String key)
     {
-        Row row = session.execute(getStatement.bind(key)).one();
+        Row row = session.execute(getStatement().bind(key)).one();
         return row == null ? null : row.getByteBuffer("value");
     }
 
     public void remove(String key)
     {
-        session.execute(removeStatement.bind(key));
+        session.execute(removeStatement().bind(key));
+    }
+
+    private PreparedStatement putStatement()
+    {
+        PreparedStatement s = putStatement;
+        return s != null ? s : (putStatement = session.prepare("INSERT INTO " + quotedTable + " (key, value) VALUES (?, ?)"));
+    }
+
+    private PreparedStatement getStatement()
+    {
+        PreparedStatement s = getStatement;
+        return s != null ? s : (getStatement = session.prepare("SELECT value FROM " + quotedTable + " WHERE key = ?"));
+    }
+
+    private PreparedStatement removeStatement()
+    {
+        PreparedStatement s = removeStatement;
+        return s != null ? s : (removeStatement = session.prepare("DELETE FROM " + quotedTable + " WHERE key = ?"));
     }
 
     /**
