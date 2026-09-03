@@ -31,14 +31,14 @@
  │            │
  │            ├─ replica == self  → performLocally() → Mutation.apply()  (no message built)
  │            └─ replica != self  → normal MUTATION_REQ / MutationVerbHandler
- │                                   (Cassandra's existing write path — this IS "BackupEntryProcessor")
+ │                                   (Cassandra's existing write path — this is the entire backup-replication mechanism)
  │            │
  │            ▼
  │      result + ack-count against CL → returned to caller (or exception on CL failure)
  └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The key architectural claim, confirmed against the actual 5.0.6 source: **there is no `BackupEntryProcessor` class or extension point in this design.** "Backup on every write" is realized entirely by handing the primary's computed delta to `StorageProxy.mutate(...)`, which is Cassandra's unmodified write path — replica resolution, dispatch, CL ack-counting, and hinted handoff are all reused verbatim. This is a simplification versus the original Hazelcast-inspired framing (Hazelcast requires a user-authored `getBackupProcessor()`); here, only `EntryProcessor` is a concept a developer implements.
+The key architectural claim, confirmed against the actual 5.0.6 source: **backup replication needs no dedicated class or extension point in this design.** "Backup on every write" is realized entirely by handing the primary's computed delta to `StorageProxy.mutate(...)`, which is Cassandra's unmodified write path — replica resolution, dispatch, CL ack-counting, and hinted handoff are all reused verbatim. This is a simplification versus the original Hazelcast-inspired framing (Hazelcast requires a user-authored `getBackupProcessor()`); here, only `EntryProcessor` is a concept a developer implements.
 
 ### Client-facing entry point: CQL native protocol via a custom `QueryHandler`
 
@@ -76,7 +76,7 @@ public interface EntryProcessorContext {
 }
 ```
 
-There is deliberately no `BackupEntryProcessor` interface (see Architecture Overview). No `EntryProcessorResult`/backup-result type either — the delta produced via `ctx.delta()` is exactly the `Mutation` that gets handed to `StorageProxy.mutate(...)`.
+No separate backup-result type exists either — the delta produced via `ctx.delta()` is exactly the `Mutation` that gets handed to `StorageProxy.mutate(...)`, and Cassandra's normal write path replicates it to the key's other natural replicas with no additional processor invocation (see Architecture Overview).
 
 | Concept | Cassandra type reused | Notes |
 |---|---|---|
@@ -133,7 +133,7 @@ Status: all nine steps are implemented and committed on the `cassandra-compute` 
 3. **Owner-resolution helper** wrapping `AbstractReplicationStrategy.getNaturalReplicasForToken(...).get(0)`, with a test asserting it's re-resolved (not cached) across a simulated topology change. Depends on #1.
 4. **New `Verb` constants + `IVersionedSerializer`s for `EntryProcessorRequest`/`Response` + `EntryProcessorRequestHandler`**, wired per the pattern of an existing verb like `MUTATION_REQ`. Depends on #2, #3.
 5. **Local fast-path dispatch logic** (the `replicas.get(0).endpoint().isSelf()` check) sitting in front of #4's handler, shared by both the local and remote invocation paths so there's exactly one code path for "run the processor," regardless of how the request arrived. Depends on #4.
-6. **Wire the produced delta into `StorageProxy.mutate(...)`** from inside the handler — this is the entire "backup" mechanism; no new replication code. Depends on #4.
+6. **Wire the produced delta into `StorageProxy.mutate(...)`** from inside the handler — this is the entire backup-replication mechanism; no new replication code. Depends on #4.
 7. **Client-facing entry point** — a `QueryHandler` implementation that intercepts the `EntryProcessor` call syntax and delegates everything else to `QueryProcessor.instance` unchanged. Sequence this after #5/#6 are proven with an internal-only test harness, since it's the newest surface area with no existing precedent to copy.
 8. **Processor registry** — how a processor class name in a request resolves to an instance on a given node (simple reflective no-arg instantiation, matching the product spec's "class reference, deployed ahead of time" decision — no classloading machinery like triggers use).
 9. **Integration tests** against a real multi-node embedded 5.0.6 cluster, verifying: routing lands on `getNaturalReplicasForToken(key).get(0)` (per product spec's acceptance criteria), replicas never invoke processor code (only mutation apply), and CL/timeout/hint behavior matches an equivalent plain CQL write at the same `ConsistencyLevel`. Depends on all above.
@@ -150,7 +150,7 @@ Everything above is server-side (compiled into `vendor/cassandra`). The product 
 - `submit(key, processorClassName[, consistencyLevel])` builds `CALL ENTRYPROCESSOR(...)` as a `SimpleStatement` (not prepared — the server-side statement can't be, see the v1 scope limits above) with all arguments escaped per the server's `''`-doubling convention, executes it, and returns the `result` blob column.
 - Failures are translated from the server's message-prefix convention (see "Failure surface" above) into `EntryProcessorFailedException` / `EntryProcessorWriteFailedException` (both extend `EntryProcessorCallException`), so a caller can `catch` the specific failure mode instead of string-matching a driver exception itself. Anything else (a genuinely malformed call, a routing/network failure) is left as whatever the driver already throws — no invented wrapper for cases the driver already models well.
 
-**Not yet built** (remaining product-spec acceptance criteria this doesn't address): `BackupEntryProcessor` as a *user-facing* submission API — today `BackupEntryProcessor` isn't a thing a client submits at all, since the technical spec's "no `BackupEntryProcessor` class" simplification (see Architecture Overview) means backup behavior is implicit in every `EntryProcessor` call, not a second call a developer makes; topology-change re-routing and primary-unreachable failover are exercised by the server-side integration test but have no client-side verification yet; and there's no live-cluster integration test for this module (`ComputeMapTest` covers CQL-string construction and failure translation only, no network I/O).
+**Not yet built** (remaining product-spec acceptance criteria this doesn't address): topology-change re-routing and primary-unreachable failover are exercised by the server-side integration test but have no client-side verification yet; and there's no live-cluster integration test for this module (`ComputeMapTest` covers CQL-string construction and failure translation only, no network I/O).
 
 ## Technical Risks & Trade-offs
 
